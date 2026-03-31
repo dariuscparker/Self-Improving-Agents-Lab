@@ -4,7 +4,8 @@ import json
 import math
 import random
 import re
-from typing import Dict, List, Optional, Sequence, Tuple
+from collections import Counter
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 try:
     import numpy as np
@@ -21,7 +22,7 @@ _JUDGE_MODEL = None
 
 def _require_numpy() -> None:
     if np is None:
-        raise ImportError("numpy is required for ensemble/math utilities in hw2_helpers.py")
+        raise ImportError("numpy is required for ensemble/math utilities in helpers.py")
 
 
 def show_example(example: Dict[str, str]) -> None:
@@ -31,22 +32,133 @@ def show_example(example: Dict[str, str]) -> None:
         print("\nTRUE ANSWER:", example["true_answer"])
 
 
-def extract_true_answer(example: Dict[str, str]) -> Optional[int]:
-    match = final_re.search(example["answer"])
+def extract_true_answer(example_or_text: Union[Dict[str, str], str]) -> Optional[int]:
+    """
+    Extract the GSM8K gold answer.
+
+    Supports either:
+    - a dict like {"answer": "... #### 42"}
+    - a raw answer string
+    """
+    if isinstance(example_or_text, dict):
+        text = str(example_or_text.get("answer", ""))
+    else:
+        text = str(example_or_text)
+
+    match = final_re.search(text)
     if match:
         return int(float(match.group(1)))
+
+    nums = number_re.findall(text)
+    if nums:
+        return int(float(nums[-1]))
+
+    return None
+
+
+def extract_pred_answer(model_text: str) -> Optional[int]:
+    """
+    Extract a predicted numeric answer from model output.
+
+    Handles:
+    - 'Final answer: 42'
+    - 'Answer = 42'
+    - GSM8K-style '#### 42'
+    - fallback to the last number in the text
+    """
+    text = str(model_text)
+
+    match = re.search(
+        r"(?:final answer|answer)\s*[:=]\s*([-+]?\d+(?:\.\d+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        return int(float(match.group(1)))
+
+    match = final_re.search(text)
+    if match:
+        return int(float(match.group(1)))
+
+    nums = number_re.findall(text)
+    if nums:
+        return int(float(nums[-1]))
+
     return None
 
 
 def extract_candidate_answer(candidate_text: str) -> Optional[int]:
     """
-    Extract the final numeric answer from GSM8K-style text.
-    Returns an int if found, otherwise None.
+    Backward-compatible alias used by the HW2 verifier code.
     """
-    match = final_re.search(candidate_text)
-    if match:
-        return int(float(match.group(1)))
-    return None
+    return extract_pred_answer(candidate_text)
+
+
+def build_messages(
+    question: str,
+    system_prompt: str = "You are a helpful math tutor. Solve the problem and give the final numeric answer.",
+) -> List[Dict[str, str]]:
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": question},
+    ]
+
+
+def generate_one(
+    question: str,
+    model,
+    tokenizer,
+    temperature: float = 0.0,
+    max_new_tokens: int = 256,
+    top_p: float = 0.95,
+    system_prompt: str = "You are a helpful math tutor. Solve the problem and give the final numeric answer.",
+):
+    """
+    Generic single-generation helper for notebook use.
+
+    Returns:
+      text, pred, input_tokens, new_tokens, total_tokens
+    """
+    import torch
+
+    messages = build_messages(question, system_prompt=system_prompt)
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        generate_kwargs = {
+            **inputs,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0.0,
+            "pad_token_id": tokenizer.eos_token_id,
+        }
+        if temperature > 0.0:
+            generate_kwargs["temperature"] = temperature
+            generate_kwargs["top_p"] = top_p
+
+        outputs = model.generate(**generate_kwargs)
+
+    gen_ids = outputs[0]
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+    input_tokens = inputs["input_ids"].shape[-1]
+    total_tokens = gen_ids.shape[-1]
+    new_tokens = max(0, total_tokens - input_tokens)
+
+    pred = extract_pred_answer(text)
+    return text, pred, int(input_tokens), int(new_tokens), int(total_tokens)
+
+
+def majority_vote(answers: Sequence[Optional[Union[str, int]]]) -> Optional[str]:
+    cleaned = [str(a) for a in answers if a is not None]
+    if len(cleaned) == 0:
+        return None
+    counts = Counter(cleaned)
+    return counts.most_common(1)[0][0]
 
 
 def verifier_exact_match(candidate_text: str, true_answer: Optional[int]) -> float:
@@ -1037,11 +1149,11 @@ def split_by_problem_id(
 def aggregate_scores_by_problem(
     rows: Sequence[Dict[str, object]],
     pred_scores: Sequence[float],
-) -> Tuple[Dict[str, List[Tuple[int, float, int]]], Dict[str, List[Tuple[int, float, int]]]]:
+) -> Dict[str, List[Tuple[int, float, int]]]:
     """
     Aggregate per-candidate scores by problem_id.
-    Returns (by_problem_with_teacher, by_problem_with_student) dicts.
-    
+    Returns a dict mapping problem_id to candidate tuples.
+
     Each problem maps to list of (candidate_idx, score, is_correct).
     """
     by_problem = {}
