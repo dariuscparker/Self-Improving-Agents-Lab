@@ -1165,3 +1165,78 @@ def aggregate_scores_by_problem(
             int(row.get("is_correct", 0))
         ))
     return by_problem
+
+
+
+def evaluate(eval_df, model, tokenizer, n_samples=1, temperature=0.0, max_questions=100):
+    t0 = time.time()
+
+    df = eval_df.copy()
+    if max_questions is not None:
+        df = df.iloc[:max_questions]
+
+    results = []
+    correct = 0
+    total_input_tokens = 0
+    total_new_tokens = 0
+    total_tokens = 0
+
+    for i in tqdm(range(len(df))):
+        q = df.iloc[i]["question"]
+        true_a = extract_true_answer(df.iloc[i]["answer"])
+
+        candidates = []
+        texts = []
+
+        # Generate candidates
+        for _ in range(n_samples):
+            text, pred, in_tok, new_tok, tot_tok = generate_one(
+                q,
+                model=model,
+                tokenizer=tokenizer,
+                temperature=temperature,
+                max_new_tokens=256,
+                top_p=0.95
+            )
+            texts.append(text)
+            candidates.append(pred)
+
+            total_input_tokens += in_tok
+            total_new_tokens += new_tok
+            total_tokens += tot_tok
+
+        # Select
+        if n_samples == 1:
+            final_pred = candidates[0]
+        else:
+            final_pred = majority_vote(candidates)
+
+        is_correct = (final_pred is not None) and (true_a is not None) and (str(final_pred) == str(true_a))
+        correct += int(is_correct)
+
+        results.append({
+            "idx": int(i),
+            "question": q,
+            "true_answer": true_a,
+            "candidates": candidates,
+            "final_pred": final_pred,
+            "correct": bool(is_correct),
+            "n_samples": int(n_samples),
+            "temperature": float(temperature),
+        })
+
+    elapsed = time.time() - t0
+    acc = correct / max(1, len(df))
+
+    metrics = {
+        "accuracy": acc,
+        "num_questions": int(len(df)),
+        "n_samples": int(n_samples),
+        "temperature": float(temperature),
+        "elapsed_sec": float(elapsed),
+        "avg_input_tokens_per_question": total_input_tokens / max(1, len(df)),
+        "avg_new_tokens_per_question": total_new_tokens / max(1, len(df)),
+        "avg_total_tokens_per_question": total_tokens / max(1, len(df)),
+    }
+
+    return metrics, results
