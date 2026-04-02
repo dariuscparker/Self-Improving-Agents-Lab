@@ -4,28 +4,45 @@ import json
 import math
 import random
 import re
+import time
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
+from tqdm import tqdm
+
 try:
     import numpy as np
-except Exception:  # pragma: no cover - handled at runtime in notebook envs
+except Exception:  # handled at runtime in notebook environments
     np = None
 
-# Shared regexes for GSM8K-style answers and numeric extraction.
+
+# =============================================================================
+# Globals and shared regexes
+# =============================================================================
+
+# GSM8K answers usually end with a line like: #### 42
 final_re = re.compile(r"####\s*([-+]?\d+(?:\.\d+)?)")
+
+# Generic number extractor used as a fallback
 number_re = re.compile(r"[-+]?\d+(?:\.\d+)?")
 
+# Optional global judge components for LLM-based process verification
 _JUDGE_TOKENIZER = None
 _JUDGE_MODEL = None
 
 
+# =============================================================================
+# Basic utilities
+# =============================================================================
+
 def _require_numpy() -> None:
+    """Raise a helpful error if numpy is unavailable."""
     if np is None:
         raise ImportError("numpy is required for ensemble/math utilities in helpers.py")
 
 
 def show_example(example: Dict[str, str]) -> None:
+    """Pretty-print a GSM8K-style example."""
     print("\nQUESTION:\n", example["question"])
     print("\nSOLUTION:\n", example["answer"])
     if "true_answer" in example:
@@ -34,7 +51,7 @@ def show_example(example: Dict[str, str]) -> None:
 
 def extract_true_answer(example_or_text: Union[Dict[str, str], str]) -> Optional[int]:
     """
-    Extract the GSM8K gold answer.
+    Extract the gold GSM8K answer as an integer.
 
     Supports either:
     - a dict like {"answer": "... #### 42"}
@@ -49,6 +66,7 @@ def extract_true_answer(example_or_text: Union[Dict[str, str], str]) -> Optional
     if match:
         return int(float(match.group(1)))
 
+    # Fallback: use the last number in the text
     nums = number_re.findall(text)
     if nums:
         return int(float(nums[-1]))
@@ -89,7 +107,10 @@ def extract_pred_answer(model_text: str) -> Optional[int]:
 
 def extract_candidate_answer(candidate_text: str) -> Optional[int]:
     """
-    Backward-compatible alias used by the HW2 verifier code.
+    Backward-compatible alias.
+
+    This keeps older notebook code working while routing to the
+    main prediction extractor.
     """
     return extract_pred_answer(candidate_text)
 
@@ -98,6 +119,7 @@ def build_messages(
     question: str,
     system_prompt: str = "You are a helpful math tutor. Solve the problem and give the final numeric answer.",
 ) -> List[Dict[str, str]]:
+    """Build chat-format messages for generation."""
     return [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": question},
@@ -114,10 +136,10 @@ def generate_one(
     system_prompt: str = "You are a helpful math tutor. Solve the problem and give the final numeric answer.",
 ):
     """
-    Generic single-generation helper for notebook use.
+    Generate one candidate solution.
 
     Returns:
-      text, pred, input_tokens, new_tokens, total_tokens
+        text, pred, input_tokens, new_tokens, total_tokens
     """
     import torch
 
@@ -153,7 +175,45 @@ def generate_one(
     return text, pred, int(input_tokens), int(new_tokens), int(total_tokens)
 
 
+def sample_candidate_texts(
+    question,
+    model,
+    tokenizer,
+    n_samples: int = 5,
+    temperature: float = 0.7,
+    max_new_tokens: int = 256,
+):
+    """
+    Generate multiple candidate solutions for one question.
+
+    This is the multi-sample wrapper around generate_one(...).
+    """
+    candidates = []
+
+    for _ in range(n_samples):
+        text, pred, in_tok, new_tok, tot_tok = generate_one(
+            question,
+            model=model,
+            tokenizer=tokenizer,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+            top_p=0.95,
+        )
+        candidates.append(
+            {
+                "text": text,
+                "pred": pred,
+                "input_tokens": in_tok,
+                "new_tokens": new_tok,
+                "total_tokens": tot_tok,
+            }
+        )
+
+    return candidates
+
+
 def majority_vote(answers: Sequence[Optional[Union[str, int]]]) -> Optional[str]:
+    """Return the most common non-null answer."""
     cleaned = [str(a) for a in answers if a is not None]
     if len(cleaned) == 0:
         return None
@@ -161,7 +221,12 @@ def majority_vote(answers: Sequence[Optional[Union[str, int]]]) -> Optional[str]
     return counts.most_common(1)[0][0]
 
 
+# =============================================================================
+# Simple verifier functions
+# =============================================================================
+
 def verifier_exact_match(candidate_text: str, true_answer: Optional[int]) -> float:
+    """Score a candidate by exact final-answer match."""
     predicted_answer = extract_candidate_answer(candidate_text)
     if predicted_answer is None or true_answer is None:
         return 0.0
@@ -169,6 +234,11 @@ def verifier_exact_match(candidate_text: str, true_answer: Optional[int]) -> flo
 
 
 def verifier_numeric_distance(candidate_text: str, true_answer: Optional[int]) -> float:
+    """
+    Score a candidate inversely by numeric distance from the gold answer.
+
+    Closer answers get higher scores.
+    """
     predicted_answer = extract_candidate_answer(candidate_text)
     if predicted_answer is None or true_answer is None:
         return 0.0
@@ -179,7 +249,7 @@ def verifier_numeric_distance(candidate_text: str, true_answer: Optional[int]) -
 
 def verifier_format_confidence(candidate_text: str) -> float:
     """
-    Heuristic confidence that text has one clean final GSM8K answer line.
+    Heuristic confidence that text contains one clean final GSM8K answer line.
     """
     matches = final_re.findall(candidate_text)
     if len(matches) == 0:
@@ -188,6 +258,32 @@ def verifier_format_confidence(candidate_text: str) -> float:
         return 0.4
     return 1.0 if "####" in candidate_text[-60:] else 0.8
 
+
+def get_simple_verifier_fn(verifier_mode: str = "exact"):
+    """
+    Return a simple verifier function by name.
+
+    Supported modes:
+    - exact
+    - numeric_distance
+    - format
+    """
+    verifier_map = {
+        "exact": verifier_exact_match,
+        "numeric_distance": verifier_numeric_distance,
+        # format verifier ignores true_answer, but we keep the same call shape
+        "format": lambda candidate_text, true_answer: verifier_format_confidence(candidate_text),
+    }
+
+    if verifier_mode not in verifier_map:
+        raise ValueError(f"Unknown verifier_mode: {verifier_mode}")
+
+    return verifier_map[verifier_mode]
+
+
+# =============================================================================
+# Process-style verifier helpers
+# =============================================================================
 
 def verifier_step_consistency(candidate_text: str) -> float:
     """
@@ -245,7 +341,7 @@ def verifier_step_consistency(candidate_text: str) -> float:
 
 
 def load_judge_model(model_name: str):
-    """Load and return tokenizer/model pair for LLM step judging."""
+    """Load a tokenizer/model pair for LLM-based step judging."""
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -264,13 +360,18 @@ def load_judge_model(model_name: str):
 
 
 def set_judge_components(judge_tokenizer, judge_model) -> None:
-    """Set global tokenizer/model used by judge helper functions."""
+    """Store global judge tokenizer/model for helper reuse."""
     global _JUDGE_TOKENIZER, _JUDGE_MODEL
     _JUDGE_TOKENIZER = judge_tokenizer
     _JUDGE_MODEL = judge_model
 
 
 def split_into_steps(candidate_text: str, max_steps: int = 12) -> List[str]:
+    """
+    Split candidate reasoning into approximate steps.
+
+    Removes the final #### answer line first.
+    """
     text = re.sub(r"####.*", "", candidate_text).strip()
     if not text:
         return []
@@ -284,6 +385,7 @@ def split_into_steps(candidate_text: str, max_steps: int = 12) -> List[str]:
 
 
 def build_step_judge_prompt(question: str, prev_steps: Sequence[str], current_step: str) -> str:
+    """Build the prompt used for a step-validity judge."""
     prev = "\n".join([f"{i+1}. {s}" for i, s in enumerate(prev_steps)]) if prev_steps else "(none yet)"
 
     return f"""
@@ -310,6 +412,9 @@ CURRENT STEP:
 
 
 def parse_judge_json(text: str) -> Dict[str, object]:
+    """
+    Parse JSON-like judge output into a normalized dict.
+    """
     match = re.search(r"\{.*\}", text, flags=re.DOTALL)
     if not match:
         return {"verdict": "invalid", "confidence": 0.0, "reason": "no json found"}
@@ -343,7 +448,8 @@ def judge_step_validity(
     judge_model=None,
 ) -> Tuple[float, Dict[str, object], str]:
     """
-    Judge one step and return (score, parsed_json, raw_generation_text).
+    Judge one reasoning step and return:
+    (score, parsed_json, raw_generation_text)
     """
     tokenizer = judge_tokenizer or _JUDGE_TOKENIZER
     model = judge_model or _JUDGE_MODEL
@@ -374,7 +480,7 @@ def judge_step_validity(
             eos_token_id=tokenizer.eos_token_id,
         )
 
-    gen_ids = out[0][inputs["input_ids"].shape[1] :]
+    gen_ids = out[0][inputs["input_ids"].shape[1]:]
     raw = tokenizer.decode(gen_ids, skip_special_tokens=True)
 
     parsed = parse_judge_json(raw)
@@ -390,6 +496,9 @@ def verifier_step_plausibility_judge(
     judge_tokenizer=None,
     judge_model=None,
 ) -> float:
+    """
+    Score a candidate by averaging judge-model step-validity scores.
+    """
     steps = split_into_steps(candidate_text, max_steps=max_steps)
     if len(steps) == 0:
         return 0.0
@@ -411,10 +520,12 @@ def verifier_step_plausibility_judge(
 
 
 def extract_all_numbers(text: str) -> List[str]:
+    """Extract all numeric substrings from text."""
     return number_re.findall(text)
 
 
 def split_reasoning_and_final(candidate_text: str) -> Tuple[str, str]:
+    """Split reasoning text from the final #### answer segment."""
     match = re.search(r"(####\s*[-+]?\d+(?:\.\d+)?)", candidate_text)
     if not match:
         return candidate_text, ""
@@ -427,6 +538,9 @@ def verifier_step_to_outcome_coherence(
     true_answer: Optional[int] = None,
     max_steps: int = 12,
 ) -> float:
+    """
+    Score coherence between reasoning steps and the final predicted answer.
+    """
     final_pred = extract_candidate_answer(candidate_text)
     if final_pred is None:
         return 0.0
@@ -476,7 +590,12 @@ def verifier_step_to_outcome_coherence(
     return max(0.0, min(1.0, score))
 
 
+# =============================================================================
+# Score normalization and calibration
+# =============================================================================
+
 def sigmoid(x: float) -> float:
+    """Compute the logistic sigmoid."""
     return float(1.0 / (1.0 + math.exp(-x)))
 
 
@@ -487,12 +606,18 @@ def zscore_sigmoid(
     temperature: float = 1.0,
     eps: float = 1e-8,
 ) -> float:
+    """
+    Normalize a scalar by z-score and squash with sigmoid.
+    """
     sigma = max(float(sigma), eps)
     z = (x - mu) / sigma
     return float(sigmoid(z / max(float(temperature), eps)))
 
 
 def rank_normalize(scores: Sequence[float]) -> List[float]:
+    """
+    Rank-normalize a list of scores to [0, 1].
+    """
     scores = list(scores)
     n = len(scores)
     if n == 0:
@@ -526,6 +651,9 @@ def score_candidates_raw(
     judge_tokenizer=None,
     judge_model=None,
 ) -> Dict[str, List[float]]:
+    """
+    Compute raw verifier scores for a set of candidate texts.
+    """
     raw = {
         "exact_match": [],
         "numeric_distance": [],
@@ -560,6 +688,9 @@ def score_candidates_raw(
 
 
 def make_demo_candidates_from_gold(example: Dict[str, object]) -> List[str]:
+    """
+    Build a small demo candidate set from one gold GSM8K example.
+    """
     gold = example["answer"]
     true_answer = int(example["true_answer"])
 
@@ -578,6 +709,9 @@ def compute_global_stats(
     judge_tokenizer=None,
     judge_model=None,
 ) -> Dict[str, Dict[str, float]]:
+    """
+    Estimate global verifier mean/std statistics from a heldout dataset.
+    """
     all_scores = {
         "exact_match": [],
         "numeric_distance": [],
@@ -626,6 +760,9 @@ def normalize_scores(
     global_stats: Dict[str, Dict[str, float]],
     temperature: float = 1.0,
 ) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
+    """
+    Produce z-score/sigmoid and rank-normalized verifier scores.
+    """
     norm_zsig: Dict[str, List[float]] = {}
     norm_rank: Dict[str, List[float]] = {}
 
@@ -641,7 +778,12 @@ def normalize_scores(
     return norm_zsig, norm_rank
 
 
+# =============================================================================
+# Candidate-pool construction for fixed-pool experiments
+# =============================================================================
+
 def _replace_final_answer(candidate_text: str, new_value: int) -> str:
+    """Replace or append a #### final answer in candidate text."""
     if final_re.search(candidate_text):
         return final_re.sub(f"#### {int(new_value)}", candidate_text)
     return candidate_text.strip() + f"\n#### {int(new_value)}"
@@ -650,7 +792,8 @@ def _replace_final_answer(candidate_text: str, new_value: int) -> str:
 def make_deceptive_wrong(candidate_text: str, nudge: int = 1) -> str:
     """
     Corrupt one arithmetic statement while preserving fluent structure.
-    Falls back to nudging the final answer.
+
+    Falls back to nudging the final answer if no simple arithmetic line is found.
     """
     lines = candidate_text.splitlines()
     add_pat = re.compile(r"(\d+)\s*\+\s*(\d+)\s*=\s*(\d+)")
@@ -676,6 +819,7 @@ def make_fixed_candidate_pool_from_gold(
 ) -> List[Dict[str, object]]:
     """
     Build a deterministic fixed candidate set from one GSM8K example.
+
     This stays generation-free and creates diverse weak-verifier failure modes.
     """
     rng = random.Random(seed)
@@ -684,7 +828,7 @@ def make_fixed_candidate_pool_from_gold(
     question = str(example["question"])
 
     variants: List[str] = []
-    variants.append(gold)  # gold
+    variants.append(gold)
     variants.append(_replace_final_answer(gold, true_answer + 1))
     variants.append(_replace_final_answer(gold, true_answer - 1))
     variants.append(_replace_final_answer(gold, true_answer + 7))
@@ -737,6 +881,9 @@ def build_fixed_candidate_pool_records(
     max_examples: Optional[int] = None,
     seed: int = 42,
 ) -> List[Dict[str, object]]:
+    """
+    Build fixed candidate-pool records over a dataset split.
+    """
     records: List[Dict[str, object]] = []
     n = len(dataset_split) if max_examples is None else min(len(dataset_split), int(max_examples))
 
@@ -754,12 +901,14 @@ def build_fixed_candidate_pool_records(
 
 
 def save_jsonl_records(records: Sequence[Dict[str, object]], path: str) -> None:
+    """Save a sequence of dict records to JSONL."""
     with open(path, "w") as f:
         for rec in records:
             f.write(json.dumps(rec) + "\n")
 
 
 def load_jsonl_records(path: str) -> List[Dict[str, object]]:
+    """Load JSONL records from disk."""
     rows: List[Dict[str, object]] = []
     with open(path, "r") as f:
         for line in f:
@@ -773,6 +922,9 @@ def score_problem_record_raw(
     judge_tokenizer=None,
     judge_model=None,
 ) -> Dict[str, List[float]]:
+    """
+    Score all candidates in one fixed-pool problem record.
+    """
     candidate_texts = [cand["text"] for cand in problem_record["candidates"]]
     return score_candidates_raw(
         question=str(problem_record["question"]),
@@ -791,6 +943,9 @@ def compute_global_stats_from_pool(
     judge_tokenizer=None,
     judge_model=None,
 ) -> Dict[str, Dict[str, float]]:
+    """
+    Estimate global verifier stats from fixed candidate-pool records.
+    """
     all_scores = {
         "exact_match": [],
         "numeric_distance": [],
@@ -825,7 +980,14 @@ def compute_global_stats_from_pool(
     return stats
 
 
+# =============================================================================
+# Matrix / ensemble utilities
+# =============================================================================
+
 def safe_corr(a: Sequence[float], b: Sequence[float]) -> float:
+    """
+    Compute correlation safely, returning 0 if either vector is near-constant.
+    """
     _require_numpy()
     arr_a = np.array(a, dtype=float)
     arr_b = np.array(b, dtype=float)
@@ -835,6 +997,7 @@ def safe_corr(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def softmax(values: Sequence[float], temperature: float = 1.0) -> np.ndarray:
+    """Compute softmax over a score vector."""
     _require_numpy()
     x = np.array(list(values), dtype=float) / max(float(temperature), 1e-8)
     x = x - np.max(x)
@@ -846,6 +1009,12 @@ def dict_to_matrix(
     norm_scores_dict: Dict[str, Sequence[float]],
     verifier_names: Optional[Sequence[str]] = None,
 ) -> Tuple[List[str], np.ndarray]:
+    """
+    Convert a dict of verifier score lists into a matrix.
+
+    Output shape is:
+        (num_verifiers, num_candidates)
+    """
     _require_numpy()
     names = list(norm_scores_dict.keys()) if verifier_names is None else list(verifier_names)
     mat = np.stack([np.array(norm_scores_dict[v], dtype=float) for v in names], axis=0)
@@ -857,6 +1026,9 @@ def loo_agreement_weights(
     temperature: float = 1.0,
     use_abs: bool = True,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
+    """
+    Estimate leave-one-out agreement weights over verifier scores.
+    """
     _require_numpy()
     names, mat = dict_to_matrix(norm_scores_dict)
     num_verifiers, _ = mat.shape
@@ -878,6 +1050,7 @@ def weighted_candidate_scores(
     norm_scores_dict: Dict[str, Sequence[float]],
     weights: Dict[str, float],
 ) -> np.ndarray:
+    """Aggregate normalized verifier scores using explicit weights."""
     _require_numpy()
     names, mat = dict_to_matrix(norm_scores_dict, verifier_names=list(weights.keys()))
     w = np.array([weights[n] for n in names], dtype=float)[:, None]
@@ -888,6 +1061,7 @@ def votes_from_scores_threshold(
     norm_scores_dict: Dict[str, Sequence[float]],
     threshold: float = 0.5,
 ) -> Tuple[List[str], np.ndarray]:
+    """Convert normalized scores into binary votes using a threshold."""
     _require_numpy()
     names, mat = dict_to_matrix(norm_scores_dict)
     votes = (mat > float(threshold)).astype(int)
@@ -898,6 +1072,7 @@ def votes_from_scores_topk(
     norm_scores_dict: Dict[str, Sequence[float]],
     top_k: int = 1,
 ) -> Tuple[List[str], np.ndarray]:
+    """Convert normalized scores into binary votes using per-verifier top-k selection."""
     _require_numpy()
     names, mat = dict_to_matrix(norm_scores_dict)
     num_verifiers, num_candidates = mat.shape
@@ -916,11 +1091,10 @@ def dawid_skene_em(
     prior: float = 0.5,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    votes: (V, C) binary matrix in {0,1}
-    Returns:
-      p_true: (C,) posterior P(z=1 | votes)
-      sens: (V,) sensitivity
-      spec: (V,) specificity
+    Run Dawid-Skene EM on a binary vote matrix.
+
+    votes shape:
+        (num_verifiers, num_candidates)
     """
     _require_numpy()
     vote_arr = np.array(votes, dtype=int)
@@ -959,6 +1133,7 @@ def dawid_skene_em(
 def pairwise_verifier_correlations(
     norm_scores_dict: Dict[str, Sequence[float]]
 ) -> Dict[Tuple[str, str], float]:
+    """Compute pairwise correlations across verifiers."""
     _require_numpy()
     names, mat = dict_to_matrix(norm_scores_dict)
     out: Dict[Tuple[str, str], float] = {}
@@ -978,8 +1153,9 @@ def fit_agreement_temperature(
     judge_model=None,
 ) -> Tuple[float, List[Dict[str, float]]]:
     """
-    Select a z-score temperature by maximizing average LOO agreement.
-    Uses only verifier score agreement, never correctness labels.
+    Select a z-score temperature by maximizing average leave-one-out agreement.
+
+    Uses verifier agreement only, not correctness labels.
     """
     n = min(int(max_examples), len(pool_records))
     rows: List[Dict[str, float]] = []
@@ -1005,7 +1181,12 @@ def fit_agreement_temperature(
     return best_temp, rows
 
 
+# =============================================================================
+# First-error localization helpers
+# =============================================================================
+
 def _has_step_local_issue(step: str) -> bool:
+    """Detect obvious local arithmetic or logical issues inside one step."""
     step_l = step.lower()
     if "division by zero" in step_l or "/ 0" in step_l or "÷ 0" in step_l:
         return True
@@ -1042,21 +1223,19 @@ def _has_step_local_issue(step: str) -> bool:
 
 def _earliest_assignment_contradiction(steps: Sequence[str]) -> Optional[int]:
     """
-    Detect repeated "X = value" statements that conflict later.
+    Detect repeated assignment statements that later contradict earlier ones.
     """
     assignment_re = re.compile(r"([A-Za-z][A-Za-z0-9_ ]{0,30})=\s*([-+]?\d+)")
     first_seen: Dict[str, Tuple[int, int]] = {}
-    earliest_conflict = None
 
     for i, step in enumerate(steps):
         for lhs, val_str in assignment_re.findall(step):
             key = re.sub(r"\s+", " ", lhs.lower().strip())
             val = int(val_str)
             if key in first_seen and first_seen[key][1] != val:
-                earliest_conflict = first_seen[key][0]
-                return earliest_conflict
+                return first_seen[key][0]
             first_seen[key] = (i, val)
-    return earliest_conflict
+    return None
 
 
 def pseudo_first_error_index(
@@ -1069,7 +1248,7 @@ def pseudo_first_error_index(
     judge_model=None,
 ) -> Optional[int]:
     """
-    Return 0-based first wrong step index, or None if no error is detected.
+    Estimate the first erroneous reasoning step in a candidate.
     """
     pred = extract_candidate_answer(candidate_text)
     if pred is not None and true_answer is not None and int(pred) == int(true_answer):
@@ -1111,6 +1290,9 @@ def step_feature_map(
     step_index: int,
     total_steps: int,
 ) -> Dict[str, float]:
+    """
+    Build simple numeric features for one reasoning step.
+    """
     step_text = current_step.strip()
     prefix_text = " ".join(prev_steps)
 
@@ -1134,13 +1316,13 @@ def split_by_problem_id(
     train_ratio: float = 0.7,
 ) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
     """
-    Split rows by unique problem ID fields with configurable train/test ratio.
+    Split rows by unique problem ID using a train/test ratio.
     """
     _require_numpy()
     problem_ids = sorted({r.get("problem_id") for r in rows})
     cut = int(train_ratio * len(problem_ids))
     train_ids = set(problem_ids[:cut])
-    
+
     train_rows = [r for r in rows if r.get("problem_id") in train_ids]
     test_rows = [r for r in rows if r.get("problem_id") not in train_ids]
     return train_rows, test_rows
@@ -1151,92 +1333,235 @@ def aggregate_scores_by_problem(
     pred_scores: Sequence[float],
 ) -> Dict[str, List[Tuple[int, float, int]]]:
     """
-    Aggregate per-candidate scores by problem_id.
-    Returns a dict mapping problem_id to candidate tuples.
-
-    Each problem maps to list of (candidate_idx, score, is_correct).
+    Aggregate per-candidate scores by problem ID.
     """
     by_problem = {}
     for row, score in zip(rows, pred_scores):
         pid = row.get("problem_id")
-        by_problem.setdefault(pid, []).append((
-            int(row.get("candidate_idx", 0)),
-            float(score),
-            int(row.get("is_correct", 0))
-        ))
+        by_problem.setdefault(pid, []).append(
+            (
+                int(row.get("candidate_idx", 0)),
+                float(score),
+                int(row.get("is_correct", 0)),
+            )
+        )
     return by_problem
 
 
+# =============================================================================
+# Unified evaluation layer for Parts 1–3
+# =============================================================================
 
-def evaluate(eval_df, model, tokenizer, n_samples=1, temperature=0.0, max_questions=100):
+def evaluate_with_selection(
+    eval_df,
+    model,
+    tokenizer,
+    n_samples: int = 1,
+    temperature: float = 0.0,
+    max_questions: int = 100,
+    max_new_tokens: int = 256,
+    selection_mode: str = "majority_vote",
+    verifier_mode: str = "exact",
+):
+    """
+    General evaluation function shared by:
+    - baseline
+    - self-consistency
+    - simple-verifier selection
+
+    selection_mode:
+    - 'majority_vote'
+    - 'simple_verifier'
+    """
     t0 = time.time()
 
     df = eval_df.copy()
     if max_questions is not None:
         df = df.iloc[:max_questions]
 
-    results = []
+    rows = []
     correct = 0
     total_input_tokens = 0
     total_new_tokens = 0
     total_tokens = 0
 
-    for i in tqdm(range(len(df))):
+    verifier_fn = None
+    if selection_mode == "simple_verifier":
+        verifier_fn = get_simple_verifier_fn(verifier_mode)
+
+    for i in tqdm(range(len(df)), desc=f"Eval: {selection_mode}"):
         q = df.iloc[i]["question"]
         true_a = extract_true_answer(df.iloc[i]["answer"])
 
-        candidates = []
-        texts = []
+        # Shared candidate-generation path for all evaluation modes
+        candidates = sample_candidate_texts(
+            question=q,
+            model=model,
+            tokenizer=tokenizer,
+            n_samples=n_samples,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+        )
 
-        # Generate candidates
-        for _ in range(n_samples):
-            text, pred, in_tok, new_tok, tot_tok = generate_one(
-                q,
-                model=model,
-                tokenizer=tokenizer,
-                temperature=temperature,
-                max_new_tokens=256,
-                top_p=0.95
-            )
-            texts.append(text)
-            candidates.append(pred)
+        total_input_tokens += sum(c["input_tokens"] for c in candidates)
+        total_new_tokens += sum(c["new_tokens"] for c in candidates)
+        total_tokens += sum(c["total_tokens"] for c in candidates)
 
-            total_input_tokens += in_tok
-            total_new_tokens += new_tok
-            total_tokens += tot_tok
+        if selection_mode == "majority_vote":
+            pred_list = [c["pred"] for c in candidates]
+            final_pred = pred_list[0] if n_samples == 1 else majority_vote(pred_list)
+            selected_score = None
 
-        # Select
-        if n_samples == 1:
-            final_pred = candidates[0]
+        elif selection_mode == "simple_verifier":
+            best_idx = None
+            best_score = float("-inf")
+
+            for j, c in enumerate(candidates):
+                score = verifier_fn(c["text"], true_a)
+                candidates[j]["verifier_score"] = float(score)
+                if score > best_score:
+                    best_score = score
+                    best_idx = j
+
+            final_pred = candidates[best_idx]["pred"]
+            selected_score = float(best_score)
+
         else:
-            final_pred = majority_vote(candidates)
+            raise ValueError(f"Unknown selection_mode: {selection_mode}")
 
-        is_correct = (final_pred is not None) and (true_a is not None) and (str(final_pred) == str(true_a))
+        is_correct = (
+            final_pred is not None
+            and true_a is not None
+            and str(final_pred) == str(true_a)
+        )
         correct += int(is_correct)
 
-        results.append({
+        row = {
             "idx": int(i),
             "question": q,
             "true_answer": true_a,
-            "candidates": candidates,
             "final_pred": final_pred,
             "correct": bool(is_correct),
             "n_samples": int(n_samples),
             "temperature": float(temperature),
-        })
+            "selection_mode": selection_mode,
+        }
+
+        if selection_mode == "majority_vote":
+            row["candidates"] = [c["pred"] for c in candidates]
+        else:
+            row["selected_score"] = selected_score
+            row["verifier_mode"] = verifier_mode
+
+        rows.append(row)
 
     elapsed = time.time() - t0
-    acc = correct / max(1, len(df))
+    accuracy = correct / max(1, len(df))
 
     metrics = {
-        "accuracy": acc,
+        "accuracy": accuracy,
         "num_questions": int(len(df)),
+        "num_correct": int(correct),
         "n_samples": int(n_samples),
         "temperature": float(temperature),
+        "selection_mode": selection_mode,
         "elapsed_sec": float(elapsed),
         "avg_input_tokens_per_question": total_input_tokens / max(1, len(df)),
         "avg_new_tokens_per_question": total_new_tokens / max(1, len(df)),
         "avg_total_tokens_per_question": total_tokens / max(1, len(df)),
     }
 
-    return metrics, results
+    if selection_mode == "simple_verifier":
+        metrics["verifier_mode"] = verifier_mode
+
+    return metrics, rows
+
+
+def evaluate(
+    eval_df,
+    model,
+    tokenizer,
+    n_samples: int = 1,
+    temperature: float = 0.0,
+    max_questions: int = 100,
+):
+    """
+    Thin wrapper for baseline and self-consistency evaluation.
+    """
+    return evaluate_with_selection(
+        eval_df=eval_df,
+        model=model,
+        tokenizer=tokenizer,
+        n_samples=n_samples,
+        temperature=temperature,
+        max_questions=max_questions,
+        max_new_tokens=256,
+        selection_mode="majority_vote",
+    )
+
+
+def best_of_n_with_simple_verifier(
+    question,
+    true_answer,
+    model,
+    tokenizer,
+    n_samples: int = 5,
+    temperature: float = 0.7,
+    max_new_tokens: int = 256,
+    verifier_mode: str = "exact",
+):
+    """
+    Generate N candidates and select the one with the best verifier score.
+
+    This helper is useful if you want to inspect a single question directly.
+    """
+    verifier_fn = get_simple_verifier_fn(verifier_mode)
+
+    candidates = sample_candidate_texts(
+        question=question,
+        model=model,
+        tokenizer=tokenizer,
+        n_samples=n_samples,
+        temperature=temperature,
+        max_new_tokens=max_new_tokens,
+    )
+
+    best_idx = None
+    best_score = float("-inf")
+
+    for i, c in enumerate(candidates):
+        score = verifier_fn(c["text"], true_answer)
+        candidates[i]["verifier_score"] = float(score)
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    best = candidates[best_idx]
+    return best, candidates
+
+
+def evaluate_best_of_n_simple_verifier(
+    eval_df,
+    model,
+    tokenizer,
+    n_samples: int = 5,
+    temperature: float = 0.7,
+    max_questions: int = 30,
+    max_new_tokens: int = 256,
+    verifier_mode: str = "exact",
+):
+    """
+    Thin wrapper for best-of-N evaluation with simple verifier-based selection.
+    """
+    return evaluate_with_selection(
+        eval_df=eval_df,
+        model=model,
+        tokenizer=tokenizer,
+        n_samples=n_samples,
+        temperature=temperature,
+        max_questions=max_questions,
+        max_new_tokens=max_new_tokens,
+        selection_mode="simple_verifier",
+        verifier_mode=verifier_mode,
+    )
