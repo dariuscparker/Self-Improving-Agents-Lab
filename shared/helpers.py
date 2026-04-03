@@ -212,6 +212,204 @@ def sample_candidate_texts(
     return candidates
 
 
+# =============================================================================
+# Frozen proposal pool helpers for fair Part 2 / Part 3 comparison
+# =============================================================================
+
+def build_generation_pool(
+    eval_df,
+    model,
+    tokenizer,
+    n_samples: int = 5,
+    temperature: float = 0.7,
+    max_questions: int = 30,
+    max_new_tokens: int = 256,
+):
+    """
+    Generate and store one shared candidate pool per question.
+
+    This lets multiple selection strategies operate on the exact same proposals,
+    which makes comparisons fairer.
+    """
+    df = eval_df.copy()
+    if max_questions is not None:
+        df = df.iloc[:max_questions]
+
+    pool = []
+    total_input_tokens = 0
+    total_new_tokens = 0
+    total_tokens = 0
+
+    for i in tqdm(range(len(df)), desc=f"Build generation pool (n={n_samples})"):
+        q = df.iloc[i]["question"]
+        true_a = extract_true_answer(df.iloc[i]["answer"])
+
+        candidates = sample_candidate_texts(
+            question=q,
+            model=model,
+            tokenizer=tokenizer,
+            n_samples=n_samples,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+        )
+
+        total_input_tokens += sum(c["input_tokens"] for c in candidates)
+        total_new_tokens += sum(c["new_tokens"] for c in candidates)
+        total_tokens += sum(c["total_tokens"] for c in candidates)
+
+        pool.append(
+            {
+                "idx": int(i),
+                "question": q,
+                "true_answer": true_a,
+                "candidates": candidates,   # full text + pred + token stats
+            }
+        )
+
+    pool_meta = {
+        "num_questions": int(len(pool)),
+        "n_samples": int(n_samples),
+        "temperature": float(temperature),
+        "avg_input_tokens_per_question": total_input_tokens / max(1, len(pool)),
+        "avg_new_tokens_per_question": total_new_tokens / max(1, len(pool)),
+        "avg_total_tokens_per_question": total_tokens / max(1, len(pool)),
+    }
+
+    return pool, pool_meta
+
+
+def select_from_candidates_majority_vote(candidates):
+    """
+    Apply majority vote to a stored candidate list.
+    """
+    pred_list = [c["pred"] for c in candidates]
+    final_pred = pred_list[0] if len(pred_list) == 1 else majority_vote(pred_list)
+
+    return {
+        "final_pred": final_pred,
+        "selected_score": None,
+        "selection_mode": "majority_vote",
+        "candidate_preds": pred_list,
+    }
+
+
+def select_from_candidates_simple_verifier(
+    candidates,
+    true_answer,
+    verifier_mode: str = "exact",
+):
+    """
+    Apply a simple verifier to a stored candidate list and select the best one.
+    """
+    verifier_fn = get_simple_verifier_fn(verifier_mode)
+
+    best_idx = None
+    best_score = float("-inf")
+
+    # Copy candidate dicts so we do not mutate the original stored pool
+    scored_candidates = [dict(c) for c in candidates]
+
+    for i, c in enumerate(scored_candidates):
+        score = verifier_fn(c["text"], true_answer)
+        scored_candidates[i]["verifier_score"] = float(score)
+
+        if score > best_score:
+            best_score = score
+            best_idx = i
+
+    return {
+        "final_pred": scored_candidates[best_idx]["pred"],
+        "selected_score": float(best_score),
+        "selection_mode": "simple_verifier",
+        "verifier_mode": verifier_mode,
+        "scored_candidates": scored_candidates,
+    }
+
+
+def evaluate_from_generation_pool(
+    generation_pool,
+    pool_meta,
+    selection_mode: str = "majority_vote",
+    verifier_mode: str = "exact",
+):
+    """
+    Evaluate a selection strategy on a frozen proposal pool.
+
+    Supported selection modes:
+    - majority_vote
+    - simple_verifier
+    """
+    t0 = time.time()
+
+    rows = []
+    correct = 0
+
+    for rec in generation_pool:
+        q = rec["question"]
+        true_a = rec["true_answer"]
+        candidates = rec["candidates"]
+
+        if selection_mode == "majority_vote":
+            selected = select_from_candidates_majority_vote(candidates)
+        elif selection_mode == "simple_verifier":
+            selected = select_from_candidates_simple_verifier(
+                candidates,
+                true_answer=true_a,
+                verifier_mode=verifier_mode,
+            )
+        else:
+            raise ValueError(f"Unknown selection_mode: {selection_mode}")
+
+        final_pred = selected["final_pred"]
+        is_correct = (
+            final_pred is not None
+            and true_a is not None
+            and str(final_pred) == str(true_a)
+        )
+        correct += int(is_correct)
+
+        row = {
+            "idx": int(rec["idx"]),
+            "question": q,
+            "true_answer": true_a,
+            "final_pred": final_pred,
+            "correct": bool(is_correct),
+            "n_samples": int(pool_meta["n_samples"]),
+            "temperature": float(pool_meta["temperature"]),
+            "selection_mode": selection_mode,
+        }
+
+        if selection_mode == "majority_vote":
+            row["candidates"] = selected["candidate_preds"]
+        else:
+            row["selected_score"] = selected["selected_score"]
+            row["verifier_mode"] = verifier_mode
+
+        rows.append(row)
+
+    elapsed = time.time() - t0
+    accuracy = correct / max(1, len(generation_pool))
+
+    metrics = {
+        "accuracy": accuracy,
+        "num_questions": int(len(generation_pool)),
+        "num_correct": int(correct),
+        "n_samples": int(pool_meta["n_samples"]),
+        "temperature": float(pool_meta["temperature"]),
+        "selection_mode": selection_mode,
+        "elapsed_sec": float(elapsed),
+        # Proposal-generation cost is shared across selectors
+        "avg_input_tokens_per_question": float(pool_meta["avg_input_tokens_per_question"]),
+        "avg_new_tokens_per_question": float(pool_meta["avg_new_tokens_per_question"]),
+        "avg_total_tokens_per_question": float(pool_meta["avg_total_tokens_per_question"]),
+    }
+
+    if selection_mode == "simple_verifier":
+        metrics["verifier_mode"] = verifier_mode
+
+    return metrics, rows
+
+
 def majority_vote(answers: Sequence[Optional[Union[str, int]]]) -> Optional[str]:
     """Return the most common non-null answer."""
     cleaned = [str(a) for a in answers if a is not None]
@@ -1565,3 +1763,326 @@ def evaluate_best_of_n_simple_verifier(
         selection_mode="simple_verifier",
         verifier_mode=verifier_mode,
     )
+
+    # =========================
+# Part 4 — Difficulty Bins
+# =========================
+
+def assign_difficulty_bin(pass_rate):
+    if pass_rate >= 0.8:
+        return "easy"
+    if pass_rate >= 0.3:
+        return "medium"
+    return "hard"
+
+
+def estimate_pass_rate_from_pool(candidates, true_answer):
+    """
+    Compute empirical pass rate from a stored candidate list.
+    """
+    correct = 0
+    total = len(candidates)
+
+    for c in candidates:
+        pred = c.get("pred")
+        if pred is not None and true_answer is not None and str(pred) == str(true_answer):
+            correct += 1
+
+    return correct / max(1, total)
+
+
+def build_difficulty_table_from_pool(generation_pool):
+    """
+    Build a difficulty table using the shared proposal pool from Parts 2 and 3.
+    This avoids regenerating candidates again.
+    """
+    rows = []
+
+    for rec in generation_pool:
+        idx = rec["idx"]
+        q = rec["question"]
+        true_a = rec["true_answer"]
+        candidates = rec["candidates"]
+
+        pass_rate = estimate_pass_rate_from_pool(candidates, true_a)
+        difficulty = assign_difficulty_bin(pass_rate)
+
+        rows.append({
+            "idx": int(idx),
+            "question": q,
+            "true_answer": true_a,
+            "pass_rate": float(pass_rate),
+            "difficulty": difficulty,
+            "n_samples_used": int(len(candidates)),
+        })
+
+    return pd.DataFrame(rows)
+
+    # =============================================================================
+# Part 5 — Sequential revisions (self-refinement)
+# =============================================================================
+
+def build_revision_prompt(question: str, previous_attempt_text: str) -> str:
+    """
+    Build a revision prompt that asks the model to critique and improve
+    its previous attempt.
+
+    This is revision-specific logic only. It does not duplicate the base
+    generation or extraction helpers.
+    """
+    return (
+        "You previously attempted the following math problem.\n"
+        "Your earlier reasoning may contain mistakes.\n"
+        "Carefully review the previous attempt, correct any errors, "
+        "and produce an improved solution.\n"
+        "End your response with a final numeric answer.\n\n"
+        f"Question:\n{question}\n\n"
+        f"Previous attempt:\n{previous_attempt_text}\n"
+    )
+
+
+def run_revision_chain(
+    question,
+    model,
+    tokenizer,
+    r_steps: int = 3,
+    base_temperature: float = 0.0,
+    rev_temperature: float = 0.7,
+    max_new_tokens: int = 256,
+):
+    """
+    Run a sequential revision chain:
+    - attempt 0: baseline generation
+    - attempts 1..R: revise previous attempt text
+
+    Reuses:
+    - generate_one(...)
+    - extract_pred_answer(...) indirectly through generate_one(...)
+    """
+    attempts = []
+
+    # Attempt 0: baseline
+    base_text, base_pred, in_tok, new_tok, total_tok = generate_one(
+        question=question,
+        model=model,
+        tokenizer=tokenizer,
+        temperature=base_temperature,
+        max_new_tokens=max_new_tokens,
+    )
+
+    attempts.append(
+        {
+            "attempt": 0,
+            "text": base_text,
+            "pred": base_pred,
+            "input_tokens": in_tok,
+            "new_tokens": new_tok,
+            "total_tokens": total_tok,
+            "attempt_type": "baseline",
+        }
+    )
+
+    prev_text = base_text
+
+    # Revision attempts
+    for step in range(1, r_steps + 1):
+        revision_prompt = build_revision_prompt(question, prev_text)
+
+        revision_text, revision_pred, in_tok, new_tok, total_tok = generate_one(
+            question=revision_prompt,
+            model=model,
+            tokenizer=tokenizer,
+            temperature=rev_temperature,
+            max_new_tokens=max_new_tokens,
+            system_prompt=(
+                "You are a careful math tutor. Review the previous attempt, "
+                "fix mistakes, and give the final numeric answer."
+            ),
+        )
+
+        attempts.append(
+            {
+                "attempt": int(step),
+                "text": revision_text,
+                "pred": revision_pred,
+                "input_tokens": in_tok,
+                "new_tokens": new_tok,
+                "total_tokens": total_tok,
+                "attempt_type": "revision",
+            }
+        )
+
+        prev_text = revision_text
+
+    return attempts
+
+
+def select_revision_attempt(
+    attempts,
+    true_answer=None,
+    selection_mode: str = "last",
+    verifier_mode: str = "exact",
+):
+    """
+    Select one attempt from a revision chain.
+
+    Supported selection modes:
+    - last: choose the final revision
+    - majority_vote: choose the most common predicted answer across attempts
+    - simple_verifier: choose the attempt with the best verifier score
+    """
+    if len(attempts) == 0:
+        raise ValueError("attempts must be non-empty")
+
+    if selection_mode == "last":
+        selected = dict(attempts[-1])
+        selected["selection_mode"] = "last"
+        return selected
+
+    if selection_mode == "majority_vote":
+        preds = [a.get("pred") for a in attempts]
+        final_pred = majority_vote(preds)
+
+        # choose the first attempt that produced that answer
+        for a in attempts:
+            if a.get("pred") is not None and str(a.get("pred")) == str(final_pred):
+                selected = dict(a)
+                selected["selection_mode"] = "majority_vote"
+                selected["candidate_preds"] = preds
+                return selected
+
+        selected = dict(attempts[-1])
+        selected["selection_mode"] = "majority_vote_fallback"
+        selected["candidate_preds"] = preds
+        return selected
+
+    if selection_mode == "simple_verifier":
+        if true_answer is None:
+            raise ValueError("true_answer is required for simple_verifier selection")
+
+        verifier_fn = get_simple_verifier_fn(verifier_mode)
+
+        best_idx = None
+        best_score = float("-inf")
+
+        for i, attempt in enumerate(attempts):
+            score = verifier_fn(attempt["text"], true_answer)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+
+        selected = dict(attempts[best_idx])
+        selected["selection_mode"] = "simple_verifier"
+        selected["verifier_mode"] = verifier_mode
+        selected["selected_score"] = float(best_score)
+        return selected
+
+    raise ValueError(f"Unknown selection_mode: {selection_mode}")
+
+
+def evaluate_revision_chains(
+    eval_df,
+    model,
+    tokenizer,
+    r_steps: int = 3,
+    base_temperature: float = 0.0,
+    rev_temperature: float = 0.7,
+    max_questions: int = 30,
+    max_new_tokens: int = 256,
+    selection_mode: str = "last",
+    verifier_mode: str = "exact",
+):
+    """
+    Evaluate sequential revision chains over an eval dataframe.
+    """
+    t0 = time.time()
+
+    df = eval_df.copy()
+    if max_questions is not None:
+        df = df.iloc[:max_questions]
+
+    rows = []
+    correct = 0
+    total_input_tokens = 0
+    total_new_tokens = 0
+    total_tokens = 0
+
+    for i in tqdm(range(len(df)), desc=f"Eval revisions: {selection_mode}"):
+        q = df.iloc[i]["question"]
+        true_a = extract_true_answer(df.iloc[i]["answer"])
+
+        attempts = run_revision_chain(
+            question=q,
+            model=model,
+            tokenizer=tokenizer,
+            r_steps=r_steps,
+            base_temperature=base_temperature,
+            rev_temperature=rev_temperature,
+            max_new_tokens=max_new_tokens,
+        )
+
+        selected = select_revision_attempt(
+            attempts=attempts,
+            true_answer=true_a,
+            selection_mode=selection_mode,
+            verifier_mode=verifier_mode,
+        )
+
+        final_pred = selected.get("pred")
+        is_correct = (
+            final_pred is not None
+            and true_a is not None
+            and str(final_pred) == str(true_a)
+        )
+        correct += int(is_correct)
+
+        total_input_tokens += sum(a["input_tokens"] for a in attempts)
+        total_new_tokens += sum(a["new_tokens"] for a in attempts)
+        total_tokens += sum(a["total_tokens"] for a in attempts)
+
+        row = {
+            "idx": int(df.iloc[i]["idx"]) if "idx" in df.columns else int(i),
+            "question": q,
+            "true_answer": true_a,
+            "final_pred": final_pred,
+            "correct": bool(is_correct),
+            "r_steps": int(r_steps),
+            "base_temperature": float(base_temperature),
+            "rev_temperature": float(rev_temperature),
+            "selection_mode": selection_mode,
+            "attempts": attempts,
+        }
+
+        if "difficulty" in df.columns:
+            row["difficulty"] = df.iloc[i]["difficulty"]
+        if "pass_rate" in df.columns:
+            row["pass_rate"] = df.iloc[i]["pass_rate"]
+
+        if selection_mode == "simple_verifier":
+            row["selected_score"] = selected.get("selected_score")
+            row["verifier_mode"] = verifier_mode
+
+        rows.append(row)
+
+    elapsed = time.time() - t0
+    accuracy = correct / max(1, len(df))
+
+    metrics = {
+        "method": "sequential_revisions",
+        "accuracy": float(accuracy),
+        "num_questions": int(len(df)),
+        "num_correct": int(correct),
+        "r_steps": int(r_steps),
+        "base_temperature": float(base_temperature),
+        "rev_temperature": float(rev_temperature),
+        "selection_mode": selection_mode,
+        "elapsed_sec": float(elapsed),
+        "avg_input_tokens_per_question": total_input_tokens / max(1, len(df)),
+        "avg_new_tokens_per_question": total_new_tokens / max(1, len(df)),
+        "avg_total_tokens_per_question": total_tokens / max(1, len(df)),
+    }
+
+    if selection_mode == "simple_verifier":
+        metrics["verifier_mode"] = verifier_mode
+
+    return metrics, rows
