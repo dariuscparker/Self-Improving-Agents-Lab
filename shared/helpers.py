@@ -7,13 +7,10 @@ import re
 import time
 from collections import Counter
 from typing import Dict, List, Optional, Sequence, Tuple, Union
-
+import pandas as pd
+import numpy as np
 from tqdm import tqdm
 
-try:
-    import numpy as np
-except Exception:  # handled at runtime in notebook environments
-    np = None
 
 
 # =============================================================================
@@ -1587,7 +1584,9 @@ def evaluate_with_selection(
     if selection_mode == "simple_verifier":
         verifier_fn = get_simple_verifier_fn(verifier_mode)
 
-    for i in tqdm(range(len(df)), desc=f"Eval: {selection_mode}"):
+    desc = "baseline" if n_samples == 1 else selection_mode
+
+    for i in tqdm(range(len(df)), desc=f"Eval: {desc}"):
         q = df.iloc[i]["question"]
         true_a = extract_true_answer(df.iloc[i]["answer"])
 
@@ -1686,7 +1685,7 @@ def evaluate(
     """
     Thin wrapper for baseline and self-consistency evaluation.
     """
-    return evaluate_with_selection(
+    return control (
         eval_df=eval_df,
         model=model,
         tokenizer=tokenizer,
@@ -2086,3 +2085,567 @@ def evaluate_revision_chains(
         metrics["verifier_mode"] = verifier_mode
 
     return metrics, rows
+
+
+# =============================================================================
+# Part 6 — Lightweight beam / search
+# =============================================================================
+
+def build_step_prompt(question: str, partial_reasoning: str) -> str:
+    """
+    Build a prompt for one-step beam expansion.
+
+    This is beam-specific prompt logic only.
+    """
+    partial_reasoning = (partial_reasoning or "").strip()
+
+    return (
+        "You are solving a math word problem step by step.\n"
+        "Write the next useful reasoning step only.\n"
+        "If you are ready to finish, end with the final numeric answer.\n\n"
+        f"Question:\n{question}\n\n"
+        f"Current partial reasoning:\n{partial_reasoning if partial_reasoning else '(start)'}\n"
+    )
+
+
+def generate_continuations_with_scores(
+    question,
+    model,
+    tokenizer,
+    num_return_sequences: int = 2,
+    temperature: float = 0.7,
+    max_new_tokens: int = 80,
+    system_prompt: str = (
+        "You are a careful math tutor. Continue the reasoning by one useful step "
+        "or provide the final numeric answer if ready."
+    ),
+):
+    """
+    Generate multiple continuations for a single prompt and compute
+    average token log-probability for each continuation.
+
+    This reuses the same chat-template approach as the rest of the notebook,
+    but adds output_scores=True so Part 6 can rank beam expansions.
+    """
+    import torch
+
+    messages = build_messages(question, system_prompt=system_prompt)
+    prompt_text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+    inputs = tokenizer(prompt_text, return_tensors="pt").to(model.device)
+
+    with torch.no_grad():
+        generate_kwargs = {
+            **inputs,
+            "max_new_tokens": max_new_tokens,
+            "do_sample": temperature > 0.0,
+            "num_return_sequences": int(num_return_sequences),
+            "return_dict_in_generate": True,
+            "output_scores": True,
+            "pad_token_id": tokenizer.eos_token_id,
+        }
+        if temperature > 0.0:
+            generate_kwargs["temperature"] = temperature
+            generate_kwargs["top_p"] = 0.95
+
+        outputs = model.generate(**generate_kwargs)
+
+    sequences = outputs.sequences
+    scores_per_step = outputs.scores
+    prompt_len = inputs["input_ids"].shape[-1]
+
+    results = []
+
+    for seq_idx in range(sequences.shape[0]):
+        full_ids = sequences[seq_idx]
+        gen_ids = full_ids[prompt_len:]
+        full_text = tokenizer.decode(full_ids, skip_special_tokens=True)
+        gen_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+
+        gen_tokens = int(gen_ids.shape[-1])
+
+        avg_logprob = 0.0
+        if gen_tokens > 0:
+            step_logps = []
+            for t in range(gen_tokens):
+                step_scores = scores_per_step[t][seq_idx]
+                log_probs = torch.log_softmax(step_scores, dim=-1)
+                tok_id = int(gen_ids[t].item())
+                step_logps.append(float(log_probs[tok_id].item()))
+            avg_logprob = float(sum(step_logps) / len(step_logps))
+
+        pred = extract_pred_answer(gen_text)
+        results.append(
+            {
+                "text": full_text,
+                "generated_text": gen_text,
+                "pred": pred,
+                "avg_logprob": avg_logprob,
+                "input_tokens": int(prompt_len),
+                "new_tokens": int(gen_tokens),
+                "total_tokens": int(full_ids.shape[-1]),
+            }
+        )
+
+    return results
+
+
+def beam_search_reasoning(
+    question,
+    model,
+    tokenizer,
+    true_answer=None,
+    beam_size: int = 3,
+    expansions_per_beam: int = 2,
+    max_steps: int = 4,
+    temperature: float = 0.7,
+    step_max_new_tokens: int = 80,
+    length_penalty: float = 0.02,
+    verifier_mode: str = "exact",
+):
+    """
+    Lightweight beam-style search over partial reasoning.
+
+    Each beam item stores:
+    - partial reasoning text
+    - accumulated score
+    - token count
+    - whether it appears finished
+    - extracted predicted answer if available
+    """
+    beam = [
+        {
+            "partial_text": "",
+            "score": 0.0,
+            "steps": 0,
+            "total_new_tokens": 0,
+            "finished": False,
+            "pred": None,
+        }
+    ]
+
+    finished = []
+
+    for step_idx in range(max_steps):
+        expanded = []
+
+        for state in beam:
+            if state["finished"]:
+                expanded.append(dict(state))
+                continue
+
+            step_prompt = build_step_prompt(question, state["partial_text"])
+
+            continuations = generate_continuations_with_scores(
+                question=step_prompt,
+                model=model,
+                tokenizer=tokenizer,
+                num_return_sequences=expansions_per_beam,
+                temperature=temperature,
+                max_new_tokens=step_max_new_tokens,
+            )
+
+            for cont in continuations:
+                prev_partial = state["partial_text"].strip()
+                continuation = cont["generated_text"].strip()
+
+                if prev_partial and continuation:
+                    new_partial = prev_partial + "\n" + continuation
+                else:
+                    new_partial = prev_partial or continuation
+
+                total_new_tokens = state["total_new_tokens"] + cont["new_tokens"]
+
+                new_score = (
+                    float(state["score"])
+                    + float(cont["avg_logprob"])
+                    - float(length_penalty) * float(total_new_tokens)
+                )
+
+                pred = extract_pred_answer(new_partial)
+                finished_flag = pred is not None
+
+                expanded.append(
+                    {
+                        "partial_text": new_partial,
+                        "score": float(new_score),
+                        "steps": int(step_idx + 1),
+                        "total_new_tokens": int(total_new_tokens),
+                        "finished": bool(finished_flag),
+                        "pred": pred,
+                    }
+                )
+
+        beam = sorted(expanded, key=lambda x: x["score"], reverse=True)[:beam_size]
+
+        for state in beam:
+            if state["finished"]:
+                finished.append(dict(state))
+
+        if len(finished) >= beam_size:
+            break
+
+    candidate_pool = finished if len(finished) > 0 else beam
+
+    if true_answer is not None:
+        verifier_fn = get_simple_verifier_fn(verifier_mode)
+
+        best_idx = None
+        best_verifier_score = float("-inf")
+
+        for i, state in enumerate(candidate_pool):
+            score = verifier_fn(state["partial_text"], true_answer)
+            if score > best_verifier_score:
+                best_verifier_score = score
+                best_idx = i
+
+        best = dict(candidate_pool[best_idx])
+        best["selected_score"] = float(best_verifier_score)
+        best["verifier_mode"] = verifier_mode
+        best["used_pool"] = "finished" if len(finished) > 0 else "beam"
+        return best
+
+    return dict(candidate_pool[0])
+
+
+def evaluate_beam_search(
+    eval_df,
+    model,
+    tokenizer,
+    beam_size: int = 3,
+    expansions_per_beam: int = 2,
+    max_steps: int = 4,
+    temperature: float = 0.7,
+    step_max_new_tokens: int = 80,
+    length_penalty: float = 0.02,
+    verifier_mode: str = "exact",
+    max_questions: int = 30,
+):
+    """
+    Evaluate beam-search style reasoning over an evaluation dataframe.
+    """
+    t0 = time.time()
+
+    df = eval_df.copy()
+    if max_questions is not None:
+        df = df.iloc[:max_questions]
+
+    rows = []
+    correct = 0
+    total_new_tokens = 0
+
+    for i in tqdm(range(len(df)), desc=f"Eval beam search (B={beam_size})"):
+        q = df.iloc[i]["question"]
+        true_a = extract_true_answer(df.iloc[i]["answer"])
+
+        selected = beam_search_reasoning(
+            question=q,
+            model=model,
+            tokenizer=tokenizer,
+            true_answer=true_a,
+            beam_size=beam_size,
+            expansions_per_beam=expansions_per_beam,
+            max_steps=max_steps,
+            temperature=temperature,
+            step_max_new_tokens=step_max_new_tokens,
+            length_penalty=length_penalty,
+            verifier_mode=verifier_mode,
+        )
+
+        final_pred = selected.get("pred")
+        is_correct = (
+            final_pred is not None
+            and true_a is not None
+            and str(final_pred) == str(true_a)
+        )
+        correct += int(is_correct)
+        total_new_tokens += int(selected.get("total_new_tokens", 0))
+
+        row = {
+            "idx": int(df.iloc[i]["idx"]) if "idx" in df.columns else int(i),
+            "question": q,
+            "true_answer": true_a,
+            "final_pred": final_pred,
+            "correct": bool(is_correct),
+            "beam_size": int(beam_size),
+            "expansions_per_beam": int(expansions_per_beam),
+            "max_steps": int(max_steps),
+            "score": float(selected.get("score", 0.0)),
+            "selected_score": float(selected.get("selected_score", 0.0)),
+            "verifier_mode": verifier_mode,
+            "used_pool": selected.get("used_pool"),
+            "total_new_tokens": int(selected.get("total_new_tokens", 0)),
+            "text": selected.get("partial_text", ""),
+        }
+
+        if "difficulty" in df.columns:
+            row["difficulty"] = df.iloc[i]["difficulty"]
+        if "pass_rate" in df.columns:
+            row["pass_rate"] = df.iloc[i]["pass_rate"]
+
+        rows.append(row)
+
+    elapsed = time.time() - t0
+    accuracy = correct / max(1, len(df))
+
+    metrics = {
+        "method": "beam_search",
+        "accuracy": float(accuracy),
+        "num_questions": int(len(df)),
+        "num_correct": int(correct),
+        "beam_size": int(beam_size),
+        "expansions_per_beam": int(expansions_per_beam),
+        "max_steps": int(max_steps),
+        "temperature": float(temperature),
+        "step_max_new_tokens": int(step_max_new_tokens),
+        "length_penalty": float(length_penalty),
+        "verifier_mode": verifier_mode,
+        "elapsed_sec": float(elapsed),
+        "avg_new_tokens_per_question": total_new_tokens / max(1, len(df)),
+    }
+
+    return metrics, rows
+
+# =============================================================================
+# Part 7 — Difficulty-aware routing policy
+# =============================================================================
+
+def run_routed_strategy(
+    question,
+    true_answer,
+    model,
+    tokenizer,
+    strategy_name: str,
+    cfg: dict,
+):
+    """
+    Run one already-defined TTC strategy under a common interface.
+
+    Supported strategies:
+    - S1: baseline single-pass
+    - S2: best-of-N majority vote
+    - S3: sequential revisions
+    - S4: beam search
+
+    Returns a normalized result dict with:
+    - pred
+    - text
+    - total_new_tokens
+    - strategy
+    """
+    strategy_name = str(strategy_name)
+
+    if strategy_name == "S1":
+        text, pred, _, new_tok, _ = generate_one(
+            question=question,
+            model=model,
+            tokenizer=tokenizer,
+            temperature=cfg.get("temperature", 0.0),
+            max_new_tokens=cfg.get("max_new_tokens", 256),
+        )
+        return {
+            "pred": pred,
+            "text": text,
+            "total_new_tokens": int(new_tok),
+            "strategy": "S1",
+        }
+
+    if strategy_name == "S2":
+        n_samples = int(cfg.get("n_samples", 5))
+        temperature = float(cfg.get("temperature", 0.7))
+        max_new_tokens = int(cfg.get("max_new_tokens", 256))
+
+        candidates = sample_candidate_texts(
+            question=question,
+            model=model,
+            tokenizer=tokenizer,
+            n_samples=n_samples,
+            temperature=temperature,
+            max_new_tokens=max_new_tokens,
+        )
+
+        pred_list = [c["pred"] for c in candidates]
+        final_pred = pred_list[0] if len(pred_list) == 1 else majority_vote(pred_list)
+
+        chosen_text = ""
+        for c in candidates:
+            if c["pred"] is not None and str(c["pred"]) == str(final_pred):
+                chosen_text = c["text"]
+                break
+
+        return {
+            "pred": final_pred,
+            "text": chosen_text,
+            "total_new_tokens": int(sum(c["new_tokens"] for c in candidates)),
+            "strategy": "S2",
+        }
+
+    if strategy_name == "S3":
+        attempts = run_revision_chain(
+            question=question,
+            model=model,
+            tokenizer=tokenizer,
+            r_steps=int(cfg.get("r_steps", 2)),
+            base_temperature=float(cfg.get("base_temperature", 0.0)),
+            rev_temperature=float(cfg.get("rev_temperature", 0.7)),
+            max_new_tokens=int(cfg.get("max_new_tokens", 256)),
+        )
+
+        selected = select_revision_attempt(
+            attempts=attempts,
+            true_answer=true_answer,
+            selection_mode=cfg.get("selection_mode", "simple_verifier"),
+            verifier_mode=cfg.get("verifier_mode", "exact"),
+        )
+
+        return {
+            "pred": selected.get("pred"),
+            "text": selected.get("text", ""),
+            "total_new_tokens": int(sum(a["new_tokens"] for a in attempts)),
+            "strategy": "S3",
+        }
+
+    if strategy_name == "S4":
+        selected = beam_search_reasoning(
+            question=question,
+            model=model,
+            tokenizer=tokenizer,
+            true_answer=true_answer,
+            beam_size=int(cfg.get("beam_size", 3)),
+            expansions_per_beam=int(cfg.get("expansions_per_beam", 2)),
+            max_steps=int(cfg.get("max_steps", 4)),
+            temperature=float(cfg.get("temperature", 0.7)),
+            step_max_new_tokens=int(cfg.get("step_max_new_tokens", 80)),
+            length_penalty=float(cfg.get("length_penalty", 0.02)),
+            verifier_mode=cfg.get("verifier_mode", "exact"),
+        )
+
+        return {
+            "pred": selected.get("pred"),
+            "text": selected.get("partial_text", ""),
+            "total_new_tokens": int(selected.get("total_new_tokens", 0)),
+            "strategy": "S4",
+        }
+
+    raise ValueError(f"Unknown strategy_name: {strategy_name}")
+
+
+def evaluate_routing_policy(
+    eval_df,
+    model,
+    tokenizer,
+    policy_map: dict,
+    cfg_map: dict,
+    max_questions: int = 30,
+    policy_name: str = "policy",
+):
+    """
+    Evaluate a difficulty-aware routing policy.
+
+    policy_map example:
+        {"easy": "S1", "medium": "S2", "hard": "S3"}
+
+    cfg_map example:
+        {
+            "S1": {...},
+            "S2": {...},
+            "S3": {...},
+            "S4": {...},
+        }
+    """
+    t0 = time.time()
+
+    df = eval_df.copy()
+    if max_questions is not None:
+        df = df.iloc[:max_questions]
+
+    rows = []
+    correct = 0
+    total_new_tokens = 0
+
+    for i in tqdm(range(len(df)), desc=f"Eval routing: {policy_name}"):
+        q = df.iloc[i]["question"]
+        true_a = extract_true_answer(df.iloc[i]["answer"])
+        difficulty = df.iloc[i]["difficulty"] if "difficulty" in df.columns else "medium"
+
+        strategy_name = policy_map.get(difficulty, "S2")
+        cfg = cfg_map.get(strategy_name, {})
+
+        out = run_routed_strategy(
+            question=q,
+            true_answer=true_a,
+            model=model,
+            tokenizer=tokenizer,
+            strategy_name=strategy_name,
+            cfg=cfg,
+        )
+
+        final_pred = out.get("pred")
+        is_correct = (
+            final_pred is not None
+            and true_a is not None
+            and str(final_pred) == str(true_a)
+        )
+        correct += int(is_correct)
+        total_new_tokens += int(out.get("total_new_tokens", 0))
+
+        row = {
+            "idx": int(df.iloc[i]["idx"]) if "idx" in df.columns else int(i),
+            "question": q,
+            "true_answer": true_a,
+            "difficulty": difficulty,
+            "strategy": strategy_name,
+            "final_pred": final_pred,
+            "correct": bool(is_correct),
+            "total_new_tokens": int(out.get("total_new_tokens", 0)),
+            "text": out.get("text", ""),
+        }
+
+        if "pass_rate" in df.columns:
+            row["pass_rate"] = df.iloc[i]["pass_rate"]
+
+        rows.append(row)
+
+    elapsed = time.time() - t0
+    accuracy = correct / max(1, len(df))
+
+    metrics = {
+        "method": "difficulty_aware_routing",
+        "policy_name": policy_name,
+        "accuracy": float(accuracy),
+        "num_questions": int(len(df)),
+        "num_correct": int(correct),
+        "avg_new_tokens_per_question": total_new_tokens / max(1, len(df)),
+        "elapsed_sec": float(elapsed),
+        "policy_map": dict(policy_map),
+    }
+
+    return metrics, rows
+
+
+def summarize_policy_results(policy_results: dict):
+    """
+    Convert a dict like:
+        {"A": metricsA, "B": metricsB, ...}
+    into a compact dataframe for comparison.
+    """
+    rows = []
+    for policy_name, metrics in policy_results.items():
+        rows.append(
+            {
+                "policy": policy_name,
+                "accuracy": metrics.get("accuracy"),
+                "num_correct": metrics.get("num_correct"),
+                "num_questions": metrics.get("num_questions"),
+                "avg_new_tokens_per_question": metrics.get("avg_new_tokens_per_question"),
+                "elapsed_sec": metrics.get("elapsed_sec"),
+            }
+        )
+    return pd.DataFrame(rows).sort_values(
+        by=["accuracy", "avg_new_tokens_per_question"],
+        ascending=[False, True],
+    )
+
