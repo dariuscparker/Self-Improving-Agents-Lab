@@ -1,111 +1,141 @@
-# Self-Improving Agent Projects
+# Self-Improving Agents
 
-A collection of projects and experiments based on Stanford’s *Self-Improving Agents* coursework (CS239A), focused on modern techniques in agentic AI, test-time compute, and verification.
+This project is a compact, hands-on exploration of **test-time compute (TTC)** for reasoning models.
 
----
+The central idea is simple and timely: if a model is small, can you still push its performance upward by changing how you use it at inference time rather than by training a bigger model?
 
-## 📌 Overview
+Instead of treating inference as a single forward pass, this project treats it as a design space. It compares one-shot generation, repeated sampling, revision loops, and lightweight search on GSM8K.
 
-This repository documents my independent study and implementation of concepts from Stanford’s Self-Improving Agents curriculum. The goal is to:
+## Why This Is Worth Reading
 
-- Stay current with emerging techniques in agentic AI
-- Implement and evaluate test-time compute (TTC) strategies
-- Explore verification, refinement, and search-based reasoning methods
-- Build practical, reproducible experiments using modern LLM tooling
+What makes this project interesting is that it is not just a collection of utilities or notebook fragments. It is one structured experiment with a clear narrative arc:
 
-This work emphasizes both **research understanding** and **hands-on implementation**.
+1. establish a baseline
+2. spend more compute in simple ways
+3. measure where that extra compute helps
+4. test more structured strategies
+5. compare the resulting TTC tradeoffs clearly
 
----
+That progression makes the project easy to follow even if the reader is new to TTC.
 
-## 🎓 Course Reference
+## What This Repo Contains
 
-- Official course page: https://cs329a.stanford.edu/
-- Lecture videos: https://www.youtube.com/playlist?list=PL3058ht9NqT1NG6Y663elpHSDh-AW1TIr
+The active project is:
 
-> Note: Exercises and implementations in this repository are self-directed and inspired by the course topics. Exercises were generated with assistance from ChatGPT to align with the curriculum. Users are highly encouraged to complete the suggested readings In the curriculum to best understand the topics covered.  
+- `modules/01_test_time_compute/01-test-time-compute.ipynb`
+- `modules/01_test_time_compute/helpers.py`
 
----
+The notebook is the main story. The helper module contains the reusable generation, selection, evaluation, revision, and search utilities so the notebook can stay focused on explanation rather than plumbing.
 
-## 🧠 Topics Covered
+## What The Notebook Covers
 
-This repository follows the core themes of Stanford’s *Self-Improving Agents* course and explores the following areas:
+The notebook is structured as one experiment with five steps:
 
-### 🔁 Self-Improvement & Scaling
-- Test-time compute scaling (Best-of-N, sampling strategies)
-- Verifier-based selection (process vs outcome supervision)
-- Constitutional AI and learning from AI feedback
-- Train-time scaling and reinforcement learning for reasoning
+1. Baseline single-pass generation
+2. Best-of-N with majority vote
+3. Difficulty estimation from sampled pass rate
+4. Sequential revision chains
+5. Lightweight beam-style search
 
-### ✅ Verification & Evaluation
-- Outcome and process verifiers
-- Weak supervision and automated verification
-- Evaluation frameworks for agent performance
-- Long-horizon and real-world task evaluation
+The notebook is built to answer one practical question:
 
-### 🧩 Reasoning, Planning & Search
-- Multi-step reasoning and decomposition
-- Sequential refinement / self-improvement loops
-- Search-based reasoning (beam search, tree-based methods)
-- Combining search with LLM inference
+How much can a small model improve if you spend extra compute at inference time, and which TTC strategy gives the best tradeoff between accuracy and cost?
 
-### 🛠️ Tool Use & Agent Capabilities
-- Tool-augmented LLMs (ReAct-style agents)
-- Code execution and feedback loops
-- Memory-augmented agents
-- Retrieval and external knowledge integration
+## Recommended Reading Order
 
-### 🤖 Agent Systems & Architectures
-- Agent orchestration and workflows
-- Autonomous research and coding agents
-- Open-ended self-improving systems
-- Agent design and system-level optimization
+For the clearest experience:
 
-### 🧪 Advanced Topics & Applications
-- AI agents for software engineering
-- Scientific discovery agents
-- Multimodal and robotics-based agents
-- Real-world agent deployment challenges
+1. Read this `README`
+2. Open `modules/01_test_time_compute/01-test-time-compute.ipynb`
+3. Use `modules/01_test_time_compute/helpers.py` only when you want implementation details
 
----
+If you are new to the project, do not start in `helpers.py`. The notebook is intentionally written to explain the ideas first and the implementation second.
 
-## 🚀 Getting Started
+## Quick Start
 
-The recommended way to use this project is in **Google Colab** so you can run notebooks and experiments without needing to configure a local Python environment first.
+The easiest way to run the project is in Google Colab with a GPU runtime, but the repo now also includes a lightweight dependency file for local reproduction.
 
-### 1. Open Google Colab
+### Colab
 
-- Go to https://colab.research.google.com/
-- Start a new notebook
-- Use a Python 3 runtime
-
-### 2. Clone This Repository in Colab
-
-Run the following command in a Colab cell:
+Clone the repo:
 
 ```bash
 !git clone https://github.com/dariuscparker/Self-Improving-Agent-Projects.git
-```
-
-Then move into the project directory:
-
-```bash
 %cd Self-Improving-Agent-Projects
 ```
 
-### 3. Work From the Repository
-
-After cloning, you can:
-
-- Open and run notebooks directly in Colab
-- Install any project-specific dependencies in notebook cells
-- Save your outputs back to GitHub or Google Drive as needed
-
-If a notebook or experiment requires additional packages, install them from a Colab cell with:
+Install dependencies:
 
 ```bash
-!pip install -r requirements.txt
+pip install -r requirements.txt
 ```
 
-If a `requirements.txt` file is not present for a specific project, install only the packages needed for that notebook or experiment.
+Then open:
 
----
+```text
+modules/01_test_time_compute/01-test-time-compute.ipynb
+```
+
+The notebook still includes an in-notebook install cell for Colab convenience and writes artifacts to:
+
+```text
+.codex/artifacts/
+```
+
+### Local
+
+Local execution is also possible if you have a Python 3 environment with the packages listed in `requirements.txt`.
+
+You will still want a GPU for a practical run.
+
+## Reproducibility
+
+For the clearest reproduction path:
+
+1. Create a fresh environment.
+2. Run `pip install -r requirements.txt`.
+3. Open `modules/01_test_time_compute/01-test-time-compute.ipynb`.
+4. Run the notebook top to bottom.
+
+Methods that use sampling (`TEMPERATURE > 0`) are stochastic. For stronger reporting, rerun those sections with multiple seeds and report the spread instead of a single lucky run.
+
+## Project Structure
+
+```text
+Self-Improving-Agents/
+├── README.md
+└── modules/
+    └── 01_test_time_compute/
+        ├── 01-test-time-compute.ipynb
+        └── helpers.py
+```
+
+## What To Expect From A Run
+
+The notebook:
+
+- loads GSM8K
+- loads a quantized `Qwen/Qwen3-1.7B` model
+- evaluates several TTC strategies on a shared subset
+- compares those strategies using accuracy, total-token cost, and runtime
+- saves summary artifacts for later analysis
+
+Some sections are intentionally more expensive than others. If you want a faster first pass, reduce `MAX_QUESTIONS`, `N_SAMPLES`, `REVISION_STEPS`, or beam settings near the top of the notebook.
+
+## Who This Is For
+
+This project should be useful to readers who want to:
+
+- understand TTC without starting from a large research codebase
+- see multiple inference-time strategies in one place
+- compare those strategies on a concrete benchmark
+- study a notebook that is organized around a single question rather than a grab bag of experiments
+
+## Why The Repo Is Structured This Way
+
+The project is deliberately split into:
+
+- notebook for explanation and experiment flow
+- helper file for reusable logic
+
+That separation keeps the narrative readable while still making the implementation easy to inspect and reuse.
