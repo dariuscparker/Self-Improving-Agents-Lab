@@ -1,0 +1,50 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ===== Virtual Environment =====
+.venv/
+venv/
+env/
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== Local agent/editor state =====
+.codex/
+
+# ===== VS Code =====
+.vscode/
+
+# ===== OS files =====
+.DS_Store
+
+# ===== Logs =====
+*.log
+
+# ===== Local caches =====
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ===== Experiment outputs and model artifacts =====
+artifacts/
+outputs/
+results/
+data/
+models/
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+humaneval_*_results.json
+gsm8k_*_results.json
+*_assignment_results.json
+
+# ===== Your custom ignore =====
+command_lines.txt
+.env
+.env.*

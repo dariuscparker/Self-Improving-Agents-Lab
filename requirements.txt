@@ -1,0 +1,11 @@
+accelerate
+bitsandbytes
+datasets
+ipykernel
+ipywidgets
+matplotlib
+numpy
+pandas
+torch
+tqdm
+transformers
