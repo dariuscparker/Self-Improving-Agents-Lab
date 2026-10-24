@@ -1,4 +1,4 @@
-# Self-Improving Agent Projects
+# Agentic AI Lab
 
 Independent, notebook-based implementations inspired by Stanford CS329A:
 Self-Improving AI Agents.
