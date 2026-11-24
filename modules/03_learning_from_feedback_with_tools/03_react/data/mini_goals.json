@@ -1,0 +1,56 @@
+[
+  {
+    "id": "G1",
+    "instruction": "Find a sensitive-skin deodorant with bright citrus scent in a 3 oz size.",
+    "target_id": "D100",
+    "required": {
+      "scent": "bright citrus",
+      "size": "3 oz"
+    }
+  },
+  {
+    "id": "G2",
+    "instruction": "Buy fragrance-free deodorant for sensitive skin in a 3 oz size.",
+    "target_id": "D102",
+    "required": {
+      "scent": "unscented",
+      "size": "3 oz"
+    }
+  },
+  {
+    "id": "G3",
+    "instruction": "Buy an insulated stainless-steel water bottle, blue, 32 oz, with a straw lid.",
+    "target_id": "B200",
+    "required": {
+      "color": "blue",
+      "capacity": "32 oz"
+    }
+  },
+  {
+    "id": "G4",
+    "instruction": "Find a black stainless-steel insulated bottle, 20 oz, with a screw cap.",
+    "target_id": "B202",
+    "required": {
+      "color": "black",
+      "capacity": "20 oz"
+    }
+  },
+  {
+    "id": "G5",
+    "instruction": "Buy navy road running shoes with cushioning, size 9.",
+    "target_id": "S300",
+    "required": {
+      "color": "navy",
+      "size": "9"
+    }
+  },
+  {
+    "id": "G6",
+    "instruction": "Find gray trail running shoes for rough surfaces, size 10.",
+    "target_id": "S301",
+    "required": {
+      "color": "gray",
+      "size": "10"
+    }
+  }
+]

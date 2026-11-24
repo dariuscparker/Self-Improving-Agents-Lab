@@ -1,0 +1,10 @@
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+react_webshop_results/
+.env
+
+!/data/
+/data/*
+!/data/mini_goals.json
+!/data/mini_products.json

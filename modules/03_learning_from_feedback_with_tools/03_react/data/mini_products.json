@@ -1,0 +1,144 @@
+[
+  {
+    "id": "D100",
+    "title": "Citrus Care Sensitive-Skin Deodorant",
+    "price": 11.49,
+    "description": "Gentle deodorant for sensitive skin with natural fragrances.",
+    "options": {
+      "scent": [
+        "bright citrus",
+        "calming lavender"
+      ],
+      "size": [
+        "3 oz",
+        "travel 1 oz"
+      ]
+    }
+  },
+  {
+    "id": "D101",
+    "title": "Citrus Sport Antiperspirant",
+    "price": 8.99,
+    "description": "Aluminum antiperspirant with a strong citrus fragrance.",
+    "options": {
+      "scent": [
+        "citrus"
+      ],
+      "size": [
+        "2 oz",
+        "3 oz"
+      ]
+    }
+  },
+  {
+    "id": "D102",
+    "title": "Gentle Unscented Deodorant",
+    "price": 9.49,
+    "description": "Deodorant for sensitive skin without fragrance.",
+    "options": {
+      "scent": [
+        "unscented"
+      ],
+      "size": [
+        "3 oz"
+      ]
+    }
+  },
+  {
+    "id": "B200",
+    "title": "Trail Steel Insulated Water Bottle",
+    "price": 24.99,
+    "description": "Leak-resistant stainless steel insulated bottle with a straw lid.",
+    "options": {
+      "color": [
+        "blue",
+        "black"
+      ],
+      "capacity": [
+        "24 oz",
+        "32 oz"
+      ]
+    }
+  },
+  {
+    "id": "B201",
+    "title": "Trail Plastic Sports Bottle",
+    "price": 12.99,
+    "description": "Lightweight plastic reusable water bottle.",
+    "options": {
+      "color": [
+        "blue",
+        "green"
+      ],
+      "capacity": [
+        "24 oz",
+        "32 oz"
+      ]
+    }
+  },
+  {
+    "id": "B202",
+    "title": "Commuter Steel Flask",
+    "price": 19.99,
+    "description": "Double-walled insulated stainless-steel bottle with screw cap.",
+    "options": {
+      "color": [
+        "black"
+      ],
+      "capacity": [
+        "20 oz"
+      ]
+    }
+  },
+  {
+    "id": "S300",
+    "title": "Everyday Road Running Shoes",
+    "price": 69.99,
+    "description": "Lightweight cushioned road running shoe with mesh upper.",
+    "options": {
+      "color": [
+        "navy",
+        "black"
+      ],
+      "size": [
+        "8",
+        "9",
+        "10"
+      ]
+    }
+  },
+  {
+    "id": "S301",
+    "title": "Mountain Trail Running Shoes",
+    "price": 74.99,
+    "description": "Grippy trail running shoe for rough surfaces.",
+    "options": {
+      "color": [
+        "navy",
+        "gray"
+      ],
+      "size": [
+        "8",
+        "9",
+        "10"
+      ]
+    }
+  },
+  {
+    "id": "S302",
+    "title": "Classic Walking Shoes",
+    "price": 54.99,
+    "description": "Comfort walking sneakers with soft lining.",
+    "options": {
+      "color": [
+        "navy",
+        "white"
+      ],
+      "size": [
+        "8",
+        "9",
+        "10"
+      ]
+    }
+  }
+]
